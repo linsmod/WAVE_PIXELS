@@ -54,7 +54,7 @@
 <div id="stage">
   <div class="cell"><div class="cap">像素图 color(RGBA)</div><div class="wrap"><canvas id="c"></canvas></div></div>
   <div class="cell"><div class="cap">位置相位场 phase(p)</div><div class="wrap"><canvas id="cphase"></canvas></div></div>
-  <div class="cell"><div class="cap">决策图 stage≠color</div><div class="wrap"><canvas id="creq"></canvas></div></div>
+  <div class="cell"><div class="cap">决策图 swapped</div><div class="wrap"><canvas id="creq"></canvas></div></div>
   <div class="cell"><div class="cap">轴指示图 X/Y</div><div class="wrap"><canvas id="cpair"></canvas></div></div>
 </div>
 <div id="err"></div>
@@ -88,7 +88,7 @@ const pair  = mkCanvas('cpair');   // 配对成功图
 // ===== 尺寸 =====
 const W = 32, H = 32;
 const TOTAL = W * H;
-const CELL_WORDS = 12;          // 12 * 4B = 48B / cell (cmd, swapped, color, stage)
+const CELL_WORDS = 8;           // 8 * 4B = 32B / cell (swapped@0, color@16)
 const REZ = 512;
 for (const { cv } of [pix, phase, req, pair]) { cv.width = REZ; cv.height = REZ; }
 
@@ -111,8 +111,7 @@ function fitStage() {
 new ResizeObserver(fitStage).observe(stageEl);
 fitStage();
 
-const CMD_ACTIVE = 0;           // 有信号
-const CMD_NOPE   = 1;           // 无信号（2-pass 协议下已不再生成，保留分支以兼容）
+// 单 Pass 方案：不再需要 cmd / stage 字段（无 NOPE 散点，所有格子都参与交换）
 
 // ===== 确定性随机（Reset 后可复现） =====
 function hash32(x) {
@@ -144,18 +143,12 @@ function initCells() {
   const f = new Float32Array(ab);
   for (let i = 0; i < TOTAL; i++) {
     const o = i * CELL_WORDS;
-    u[o+0] = CMD_ACTIVE;                        // cmd
-    u[o+1] = 0;                                 // swapped（本轮是否交换）
+    u[o+0] = 0;                                 // swapped（本轮是否交换，调试视图用）
     // color @ word4..7（vec4，需 16 字节对齐 → word4）
     f[o+4] = rnd01(i, 1);                       // R
     f[o+5] = rnd01(i, 2);                       // G
     f[o+6] = rnd01(i, 3);                       // B
     f[o+7] = 1.0;                               // A
-    // stage @ word8..11（初始化为自身 color，首帧未 dispatch 时也不会黑）
-    f[o+8]  = f[o+4];
-    f[o+9]  = f[o+5];
-    f[o+10] = f[o+6];
-    f[o+11] = f[o+7];
   }
   device.queue.writeBuffer(cellBuf, 0, ab);
 }
@@ -183,22 +176,16 @@ writeRP(0, 16, 20, 1);
 
 // ========================================================
 //  WGSL: compute
-//  2-Pass 协议（每轮 2 个 pass）：
-//    pass_DECIDE（决策，纯读邻、写自己 stage）
-//    pass_COMMIT（提交，只写自己 color = stage）
+//  1-Pass 协议（单趟）：
+//    pass_SWAP（位置单数像素当裁决者，独占读写一对 color 直接交换）
 //  帧号决定轴，位置奇偶决定方向，配对唯一、谓词对称。
 // ========================================================
 const computeWGSL = /* wgsl */`
-const CMD_ACTIVE: u32 = 0u;
-const CMD_NOPE:   u32 = 1u;
-
-// 布局必须与 JS 侧一致：48B（cmd, swapped, color@16, stage@32）
+// 布局必须与 JS 侧一致：32B（swapped@0, color@16）
 // 相位属于 position：像素只携带 color（键由 color 导出）
 struct Cell {
-  cmd:      u32,
-  swapped:  u32,
-  color:    vec4<f32>,
-  stage:    vec4<f32>,
+  swapped:  u32,       // 0=未交换 1=交换（调试视图用）
+  color:    vec4<f32>, // @16 交换标的物 RGBA（键由它导出）
 };
 
 struct FieldParams {
@@ -258,52 +245,48 @@ fn swap_gain(ki: f32, kj: f32,
 }
 
 // ========================================================
-//  2-Pass 协议（每轮仅 2 个 pass）
-//    帧号决定轴（misc.w=0→X，1→Y），位置奇偶决定方向，
-//    每像素配对唯一 → 对称谓词使双方独立算出同一结果。
-//    Pass1 决策：纯读对方旧 color、写自己 stage（无竞争）
-//    Pass2 提交：只写自己 color = stage
+//  1-Pass 协议（单趟完成）
+//    帧号决定轴（misc.w=0→X，1→Y）。
+//    仅「位置单数」像素作为裁决者（X 轴看 x 奇偶、Y 轴看 y 奇偶），
+//    朝 -axis 方向配对唯一偶数伙伴 → 对称谓词使整对同换同不换。
+//    裁决者独占读写该对的两个 color（无跨线程竞争），
+//    故无需 stage 中转、也无需第二趟提交。
 // ========================================================
 
-// Pass 1：决策（读邻居旧值，写 stage）
+// 单 Pass 交换：仅位置单数像素当裁决者，独占读写它那一对的两个 color
 @compute @workgroup_size(8, 8)
-fn pass_DECIDE(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pass_SWAP(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= gw() || gid.y >= gh()) { return; }
   let i = idx(gid.x, gid.y);
-  cells[i].stage = cells[i].color;                 // 默认不动
-  cells[i].swapped = 0u;
 
-  if (cells[i].cmd == CMD_NOPE) { return; }        // 无信号格不参与
-
-  // 帧号决定轴：misc.w = 0 → X，1 → Y
   let axis = u32(fp.misc.w);
-  let t = select(gid.y, gid.x, axis == 0u);
-  let even = (t & 1u) == 0u;
+  // 仅坐标单数的像素是裁决者：X 轴看 x 奇偶，Y 轴看 y 奇偶
+  let isDecider = select((gid.y & 1u) == 1u, (gid.x & 1u) == 1u, axis == 0u);
+  if (!isDecider) { return; }                      // 偶数像素为被动伙伴，由裁决者替它换
 
+  // 单数像素必有一个 -axis 方向的偶数邻居（x-1 / y-1 恒 >= 0）
   var nbr = vec2<i32>(gid.xy);
-  if (axis == 0u) { nbr.x = nbr.x + select(-1, 1, even); }
-  else            { nbr.y = nbr.y + select(-1, 1, even); }
-
-  if (nbr.x < 0 || nbr.y < 0 || nbr.x >= i32(gw()) || nbr.y >= i32(gh())) { return; }
+  if (axis == 0u) { nbr.x = nbr.x - 1; }
+  else            { nbr.y = nbr.y - 1; }
   let j = idx(u32(nbr.x), u32(nbr.y));
-  if (cells[j].cmd == CMD_NOPE) { return; }        // 对侧无信号也不换
 
+  // 先把双方旧 color 读进局部变量，再交换 —— 每格 color 仅由本裁决者读写，无竞争
+  let ci = cells[i].color;
+  let cj = cells[j].color;
   let pi = vec2<f32>(gid.xy);
   let pj = vec2<f32>(vec2<u32>(u32(nbr.x), u32(nbr.y)));
-  let g = swap_gain(key_of(cells[i].color), key_of(cells[j].color), pi, pj);
+  let g = swap_gain(key_of(ci), key_of(cj), pi, pj);
 
   if (g > fp.misc.x) {
-    cells[i].stage = cells[j].color;               // 记下要换成的值（旧值，安全）
+    // 对称谓词 → 整对要么都换要么都不换；直接交换 color，并标记双方
+    cells[i].color = cj;
+    cells[j].color = ci;
     cells[i].swapped = 1u;
+    cells[j].swapped = 1u;
+  } else {
+    cells[i].swapped = 0u;
+    cells[j].swapped = 0u;
   }
-}
-
-// Pass 2：提交（只写自己）
-@compute @workgroup_size(8, 8)
-fn pass_COMMIT(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= gw() || gid.y >= gh()) { return; }
-  let i = idx(gid.x, gid.y);
-  cells[i].color = cells[i].stage;
 }
 `;
 
@@ -311,17 +294,13 @@ fn pass_COMMIT(@builtin(global_invocation_id) gid: vec3<u32>) {
 //  WGSL: render（4 个视图，共用同一份 cell buffer）
 //    fs       像素图     —— color.rgb
 //    fs_phase 位置相位场 —— field_phase(p)（相位属于 position）
-//    fs_req   决策图     —— 本轮 Pass1 决策（swapped）
+//    fs_req   决策图     —— 本轮交换（swapped）
 //    fs_pair  轴指示图   —— 当前处理轴（X/Y）
 // ========================================================
 const renderWGSL = /* wgsl */`
-const CMD_NOPE: u32 = 1u;
-
 struct Cell {
-  cmd:      u32,       // 0=有信号 1=无信号
-  swapped:  u32,       // 本轮 Pass1 决策：是否发生交换
+  swapped:  u32,       // 0=未交换 1=交换（调试视图用）
   color:    vec4<f32>, // @16 交换标的物 RGBA（键由它导出）
-  stage:    vec4<f32>, // @32 暂存：Pass1 决定的新 color
 };
 
 struct RP {
@@ -381,7 +360,7 @@ fn hash01(x0: u32) -> f32 {
 @fragment
 fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let c = cells[cell_at(fc).z];
-  return vec4<f32>(c.color.rgb, 1.0);   // 直接画真实颜色，不管 cmd
+  return vec4<f32>(c.color.rgb, 1.0);   // 直接画真实颜色
 }
 
 // ---- 视图 2：位置相位场（相位是位置的固有属性，不随像素迁移） ----
@@ -393,15 +372,12 @@ fn fs_phase(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(col, 1.0);
 }
 
-// ---- 视图 3：决策图（本轮 Pass1 的决策） ----
-//   绿 = 决定交换（swapped）   灰 = 不动（stage==color）   黑 = NOPE
+// ---- 视图 3：决策图（本轮是否交换） ----
+//   绿 = 发生交换（swapped）   灰 = 不动
 @fragment
 fn fs_req(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let g = cell_at(fc);
   let c = cells[g.z];
-  if (c.cmd == CMD_NOPE) {
-    return vec4<f32>(vec3<f32>(0.03, 0.03, 0.05), 1.0);
-  }
   let changed = c.swapped == 1u;
   var col = vec3<f32>(0.15, 0.15, 0.20);
   if (changed) { col = vec3<f32>(0.20, 0.95, 0.40); }
@@ -409,17 +385,20 @@ fn fs_req(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 }
 
 // ---- 视图 4：轴指示图 ----
-//   底色随本帧轴（X=蓝 / Y=橙），发生交换的格子更亮
+//   底色中性稳定（不随轴闪烁）；发生交换的格子按当前轴提亮；
+//   左上角小方块（约 24px）指示当前处理轴（X=蓝 / Y=橙）——不再整屏闪。
 @fragment
 fn fs_pair(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let g = cell_at(fc);
   let c = cells[g.z];
-  if (c.cmd == CMD_NOPE) {
-    return vec4<f32>(vec3<f32>(0.05, 0.05, 0.07), 1.0);
-  }
   let axis = u32(rp.screen.w);
-  var col = select(vec3<f32>(0.15, 0.25, 0.55), vec3<f32>(0.55, 0.35, 0.15), axis == 1u);
-  if (c.swapped == 1u) { col = col * 1.6; }
+  var col = vec3<f32>(0.10, 0.10, 0.13);                 // 稳定中性底
+  if (c.swapped == 1u) {
+    col = select(vec3<f32>(0.20, 0.55, 0.95), vec3<f32>(0.95, 0.60, 0.22), axis == 1u) * 1.3;
+  }
+  if (fc.x < 24.0 && fc.y < 24.0) {                      // 角落徽标：仅在小块随轴变色
+    col = select(vec3<f32>(0.15, 0.35, 0.95), vec3<f32>(0.95, 0.55, 0.15), axis == 1u);
+  }
   return vec4<f32>(col, 1.0);
 }
 `;
@@ -463,8 +442,7 @@ const rendLayout = device.createPipelineLayout({ bindGroupLayouts: [rendBGL] });
 
 // 用 error scope 捕获 pipeline 校验错误，避免它们退化成 submit 时的 CommandBuffer 报错
 device.pushErrorScope('validation');
-const pDecide = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_DECIDE' } });
-const pCommit = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_COMMIT' } });
+const pSwap = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_SWAP' } });
 
 const mkRenderPipe = (entry) => device.createRenderPipeline({
   layout: rendLayout,
@@ -612,8 +590,7 @@ function frame() {
   if (advance) {
     frameNo++;
     for (let r = 0; r < rounds; r++) {
-      dispatch(enc, pDecide);      // Pass1 决策
-      dispatch(enc, pCommit);      // Pass2 提交
+      dispatch(enc, pSwap);        // 单趟交换
     }
     currentAxis = 1 - currentAxis;   // 下一帧切到另一轴，保证 X、Y 都被处理
   }
