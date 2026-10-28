@@ -45,6 +45,7 @@
   <label>Gain ε <span id="epsV">0.000</span><input id="eps" type="range" min="-2" max="2" step="0.01" value="0.000"></label>
   <label>Speed <span id="spdV">1.00</span><input id="spd" type="range" min="0" max="3" step="0.05" value="1"></label>
   <label>Rounds/frame <span id="rndV">1</span><input id="rnd" type="range" min="1" max="4" step="1" value="1"></label>
+  <label>Steps/sec <span id="spsV">60</span><input id="sps" type="range" min="1" max="144" step="1" value="60"></label>
   <label>Period X <span id="pxV">16</span><input id="px" type="range" min="6" max="48" step="1" value="16"></label>
   <label>Period Y <span id="pyV">20</span><input id="py" type="range" min="6" max="48" step="1" value="20"></label>
   <label>键源 <select id="kmode"><option value="0" selected>颜色明度</option><option value="1">颜色色相</option></select></label>
@@ -492,6 +493,7 @@ const ui = {
   px:    document.getElementById('px'),
   py:    document.getElementById('py'),
   kmode: document.getElementById('kmode'),
+  sps:   document.getElementById('sps'),
   pause: document.getElementById('pause'),
   step:  document.getElementById('step'),
   reset: document.getElementById('reset'),
@@ -502,6 +504,7 @@ const ui = {
 ui.eps.oninput   = () => document.getElementById('epsV').textContent = (+ui.eps.value).toFixed(3);
 ui.spd.oninput   = () => document.getElementById('spdV').textContent = (+ui.spd.value).toFixed(2);
 ui.rnd.oninput   = () => document.getElementById('rndV').textContent = ui.rnd.value;
+ui.sps.oninput   = () => document.getElementById('spsV').textContent = ui.sps.value;
 ui.px.oninput    = () => document.getElementById('pxV').textContent = ui.px.value;
 ui.py.oninput    = () => document.getElementById('pyV').textContent = ui.py.value;
 
@@ -537,6 +540,8 @@ function writeField(t, perX, perY, eps, axis, keyMode, flip) {
 
 // ===== 主循环 =====
 let tAcc = 0;
+let stepAcc = 0;            // Steps/sec 节流累积器（真实秒）
+const STEP_DT = 1 / 60;     // 每步固定的时间增量（与帧率解耦）
 let frameNo = 0;
 let swpStep = 0;            // 0:X偶 1:Y偶 2:X奇 3:Y奇，逐帧循环覆盖全部相邻对
 let lastTime = performance.now();
@@ -576,12 +581,26 @@ function frame() {
     fpsAcc = 0; fpsCount = 0;
   }
 
-  // 单帧步进：暂停时按 Step 只推进恰好一帧
+  // 步进节流：用 Steps/sec 把模拟步进速率与帧率解耦
   const stepping = stepReq;
   stepReq = false;
-  const advance = (!paused) || stepping;
 
-  if (advance) tAcc += dt * (+ui.spd.value);
+  const sps = +ui.sps.value;
+  const dtStep = 1 / sps;                 // 每步对应的真实秒数
+  let doStep = false;
+  if (!paused) {
+    stepAcc += dt;
+    if (stepAcc >= dtStep) {              // 一帧内至多一步（受刷新率上限约束）
+      doStep = true;
+      stepAcc = stepAcc % dtStep;         // 保留余量，也避免高频 sps 下无限累积
+    }
+  } else {
+    stepAcc = 0;                          // 暂停时不累积，恢复后不突进
+  }
+  if (stepping) { doStep = true; stepAcc = 0; }   // 手动单步：强制一步
+
+  const advance = doStep;
+  if (advance) tAcc += STEP_DT * (+ui.spd.value);   // 每步固定时间增量，与帧率无关
 
   const eps  = +ui.eps.value;
   const perX = +ui.px.value, perY = +ui.py.value;
