@@ -47,7 +47,6 @@
   <label>Rounds/frame <span id="rndV">1</span><input id="rnd" type="range" min="1" max="4" step="1" value="1"></label>
   <label>Period X <span id="pxV">16</span><input id="px" type="range" min="6" max="48" step="1" value="16"></label>
   <label>Period Y <span id="pyV">20</span><input id="py" type="range" min="6" max="48" step="1" value="20"></label>
-  <label>方向源 <select id="dmode"><option value="0">相位扇区</option><option value="1" selected>相位选轴</option><option value="2">最优邻格</option></select></label>
   <label>键源 <select id="kmode"><option value="0" selected>颜色明度</option><option value="1">颜色色相</option></select></label>
   <div class="row"><button id="pause">Pause</button><button id="step">Step</button><button id="reset">Reset</button></div>
   <div id="fps">FPS: --</div>
@@ -55,8 +54,8 @@
 <div id="stage">
   <div class="cell"><div class="cap">像素图 color(RGBA)</div><div class="wrap"><canvas id="c"></canvas></div></div>
   <div class="cell"><div class="cap">位置相位场 phase(p)</div><div class="wrap"><canvas id="cphase"></canvas></div></div>
-  <div class="cell"><div class="cap">请求图</div><div class="wrap"><canvas id="creq"></canvas></div></div>
-  <div class="cell"><div class="cap">配对成功图</div><div class="wrap"><canvas id="cpair"></canvas></div></div>
+  <div class="cell"><div class="cap">决策图 stage≠color</div><div class="wrap"><canvas id="creq"></canvas></div></div>
+  <div class="cell"><div class="cap">轴指示图 X/Y</div><div class="wrap"><canvas id="cpair"></canvas></div></div>
 </div>
 <div id="err"></div>
 
@@ -89,7 +88,7 @@ const pair  = mkCanvas('cpair');   // 配对成功图
 // ===== 尺寸 =====
 const W = 32, H = 32;
 const TOTAL = W * H;
-const CELL_WORDS = 20;          // 20 * 4B = 80B / cell
+const CELL_WORDS = 12;          // 12 * 4B = 48B / cell (cmd, swapped, color, stage)
 const REZ = 512;
 for (const { cv } of [pix, phase, req, pair]) { cv.width = REZ; cv.height = REZ; }
 
@@ -113,12 +112,7 @@ new ResizeObserver(fitStage).observe(stageEl);
 fitStage();
 
 const CMD_ACTIVE = 0;           // 有信号
-const CMD_NOPE   = 1;           // 无信号（不参与）
-const ST_NOPE    = 0;           // 状态：空闲
-const ST_CAND    = 1;           // 状态：已选方向，待比较
-const ST_REQ     = 2;           // 状态：已发起请求
-const ST_DONE    = 3;           // 状态：本轮完成交换
-const INVALID    = 0xFFFFFFFF;
+const CMD_NOPE   = 1;           // 无信号（2-pass 协议下已不再生成，保留分支以兼容）
 
 // ===== 确定性随机（Reset 后可复现） =====
 function hash32(x) {
@@ -151,19 +145,17 @@ function initCells() {
   for (let i = 0; i < TOTAL; i++) {
     const o = i * CELL_WORDS;
     u[o+0] = CMD_ACTIVE;                        // cmd
-    u[o+1] = 0;                                 // dir
-    u[o+2] = ST_NOPE;                           // state
-    u[o+3] = INVALID;                           // wish
-    u[o+4] = INVALID;                           // nbr
-    f[o+5] = 0;                                 // delta
-    u[o+6] = INVALID;                           // in_dir
-    u[o+7] = INVALID;                           // partner
-    f[o+8]  = rnd01(i, 1);                      // R
-    f[o+9]  = rnd01(i, 2);                      // G
-    f[o+10] = rnd01(i, 3);                      // B
-    f[o+11] = 1.0;                             // A
-    // 稀疏散点：无信号格子（检验「那个方向的信号存在时」这一分支）
-    if (rnd01(i, 5) < 0.03) u[o+0] = CMD_NOPE;
+    u[o+1] = 0;                                 // swapped（本轮是否交换）
+    // color @ word4..7（vec4，需 16 字节对齐 → word4）
+    f[o+4] = rnd01(i, 1);                       // R
+    f[o+5] = rnd01(i, 2);                       // G
+    f[o+6] = rnd01(i, 3);                       // B
+    f[o+7] = 1.0;                               // A
+    // stage @ word8..11（初始化为自身 color，首帧未 dispatch 时也不会黑）
+    f[o+8]  = f[o+4];
+    f[o+9]  = f[o+5];
+    f[o+10] = f[o+6];
+    f[o+11] = f[o+7];
   }
   device.queue.writeBuffer(cellBuf, 0, ab);
 }
@@ -178,60 +170,42 @@ const rpBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GP
 const RP = new ArrayBuffer(48);
 const rpU = new Uint32Array(RP);
 const rpF = new Float32Array(RP);
-function writeRP(t, perX, perY) {
+function writeRP(t, perX, perY, axis) {
   rpU[0] = W; rpU[1] = H; rpU[2] = 0; rpU[3] = 0;
-  rpF[4] = REZ; rpF[5] = REZ; rpF[6] = REZ / W; rpF[7] = 0;
+  rpF[4] = REZ; rpF[5] = REZ; rpF[6] = REZ / W; rpF[7] = axis;   // screen.w 传当前轴给渲染侧
   rpF[8] = wrapTau(t);
   rpF[9] = 2 * Math.PI / perX;                 // kx
   rpF[10] = 2 * Math.PI / perY;                // ky
   rpF[11] = 0;
   device.queue.writeBuffer(rpBuf, 0, RP);
 }
-writeRP(0, 16, 20);
+writeRP(0, 16, 20, 1);
 
 // ========================================================
 //  WGSL: compute
-//  协议（每轮 6 个 pass，与方向数无关）：
-//    请求阶段  pass_DIR → pass_DELTA → pass_WISH
-//    处理阶段  pass_RDIR → pass_PROCWISH → pass_SWAPWISH
+//  2-Pass 协议（每轮 2 个 pass）：
+//    pass_DECIDE（决策，纯读邻、写自己 stage）
+//    pass_COMMIT（提交，只写自己 color = stage）
+//  帧号决定轴，位置奇偶决定方向，配对唯一、谓词对称。
 // ========================================================
 const computeWGSL = /* wgsl */`
 const CMD_ACTIVE: u32 = 0u;
 const CMD_NOPE:   u32 = 1u;
-const ST_NOPE:    u32 = 0u;
-const ST_CAND:    u32 = 1u;
-const ST_REQ:     u32 = 2u;
-const ST_DONE:    u32 = 3u;
-const INVALID:    u32 = 0xFFFFFFFFu;
 
-// 4 个方向：0=+X 1=+Y 2=-X 3=-Y
-const DIR_RIGHT: u32 = 0u;
-const DIR_DOWN:  u32 = 1u;
-const DIR_LEFT:  u32 = 2u;
-const DIR_UP:    u32 = 3u;
-
-// 布局必须与 JS 侧一致：80B
-// 相位属于 position：像素不再携带 ph，只有 color（键由 color 导出）
+// 布局必须与 JS 侧一致：48B（cmd, swapped, color@16, stage@32）
+// 相位属于 position：像素只携带 color（键由 color 导出）
 struct Cell {
-  cmd:      u32,      // @0
-  dir:      u32,      // @4
-  state:    u32,      // @8
-  wish:     u32,      // @12   想交换的目标（格子索引）
-  nbr:      u32,      // @16   方向指向的邻居
-  delta:    f32,      // @20   与邻居的比较结果（自己记录）
-  in_dir:   u32,      // @24   请求来自哪个方向
-  partner:  u32,      // @28   互愿伙伴
-  color:    vec4<f32>,// @32   交换标的物 RGBA（键由它导出）
-  stage:    vec4<f32>,// @48   暂存的对方旧 color
-  _p0:      f32,      // @64   保留（保持 80B 步长）
-  _p1:      f32,      // @68   保留
+  cmd:      u32,
+  swapped:  u32,
+  color:    vec4<f32>,
+  stage:    vec4<f32>,
 };
 
 struct FieldParams {
   dims:  vec4<u32>, // W, H, _, _
   wave:  vec4<f32>, // t, kx, ky, _
   phase: vec4<f32>, // (相位图增益), _, _, _
-  misc:  vec4<f32>, // gain_eps, dir_mode(0=相位扇区,1=相位选轴,2=最优邻格), key_mode(0=明度,1=色相), _
+  misc:  vec4<f32>, // gain_eps, _, key_mode(0=明度,1=色相), axis(0=X,1=Y)
 };
 
 @group(0) @binding(0) var<storage, read_write> cells: array<Cell>;
@@ -240,15 +214,6 @@ struct FieldParams {
 fn gw() -> u32 { return fp.dims.x; }
 fn gh() -> u32 { return fp.dims.y; }
 fn idx(x: u32, y: u32) -> u32 { return x + y * gw(); }
-
-fn dir_offset(d: u32) -> vec2<i32> {
-  switch d {
-    case DIR_RIGHT: { return vec2<i32>( 1,  0); }
-    case DIR_DOWN:  { return vec2<i32>( 0,  1); }
-    case DIR_LEFT:  { return vec2<i32>(-1,  0); }
-    default:        { return vec2<i32>( 0, -1); }
-  }
-}
 
 // 正弦场在位置 p 的相位 —— 相位属于 position，是纯位置函数
 fn field_phase(p: vec2<f32>) -> f32 {
@@ -259,7 +224,6 @@ fn field_phase(p: vec2<f32>) -> f32 {
 // 颜色 → 排序键 ∈ [0, 2π)
 //   key_mode=0：明度 luma ∈ [0,1] → [0,2π)
 //   key_mode=1：色相 hue ∈ [0,1) → [0,2π)
-// 键随颜色一起迁移（颜色被交换时键自动跟着走），因此不再单独存 ph。
 fn key_of(c: vec4<f32>) -> f32 {
   if (fp.misc.z > 0.5) {
     // 标准 RGB→HSV 色相角
@@ -272,7 +236,7 @@ fn key_of(c: vec4<f32>) -> f32 {
     else if (mx == c.g) { h = 2.0 + (c.b - c.r) / d; }
     else                { h = 4.0 + (c.r - c.g) / d; }
     h = h / 6.0;
-    if (h < 0.0) { h = h + 1.0; }             // 归一化到 [0,1)
+    if (h < 0.0) { h = h + 1.0; }
     return h * 6.2831853;
   }
   // Rec.709 明度
@@ -280,12 +244,12 @@ fn key_of(c: vec4<f32>) -> f32 {
   return clamp(luma, 0.0, 1.0) * 6.2831853;
 }
 
-// 亲和性 ∈ [-1,1]：键 k 放在位置 p 处的亲和度
+// 亲和性 ∈ [-1,1]
 fn affinity(k: f32, p: vec2<f32>) -> f32 {
   return cos(field_phase(p) + k);
 }
 
-// 对称交换增益：交换后总亲和 − 当前总亲和
+// 对称交换增益：交换后总亲和 − 当前总亲和（(i,j) 交换逐项相等）
 fn swap_gain(ki: f32, kj: f32,
              pi: vec2<f32>, pj: vec2<f32>) -> f32 {
   let cur = affinity(ki, pi) + affinity(kj, pj);
@@ -293,173 +257,53 @@ fn swap_gain(ki: f32, kj: f32,
   return swp - cur;
 }
 
-// 相位 → 4 个方向（象限轮转）：相位每转 90° 方向转 90°
-fn phase_dir(psi: f32) -> u32 {
-  let f = fract(psi / 6.2831853);
-  return u32(floor(f * 4.0));
-}
-
-// 相位 → 方向轴（0=X 1=Y）：相位所在的半波决定走哪个轴
-fn phase_axis(psi: f32) -> u32 {
-  if (fract(psi / 6.2831853) < 0.5) { return 0u; }
-  return 1u;
-}
-
 // ========================================================
-//  请求阶段
+//  2-Pass 协议（每轮仅 2 个 pass）
+//    帧号决定轴（misc.w=0→X，1→Y），位置奇偶决定方向，
+//    每像素配对唯一 → 对称谓词使双方独立算出同一结果。
+//    Pass1 决策：纯读对方旧 color、写自己 stage（无竞争）
+//    Pass2 提交：只写自己 color = stage
 // ========================================================
 
-// pass_DIR：由正弦波相位决定朝哪个方向移动，并确认那个方向的信号是否存在
+// Pass 1：决策（读邻居旧值，写 stage）
 @compute @workgroup_size(8, 8)
-fn pass_DIR(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pass_DECIDE(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= gw() || gid.y >= gh()) { return; }
   let i = idx(gid.x, gid.y);
-  if (cells[i].cmd == CMD_NOPE) {
-    cells[i].state = ST_NOPE;
-    cells[i].wish  = INVALID;
-    cells[i].nbr   = INVALID;
-    cells[i].delta = 0.0;
-    return;
-  }
-  let p = vec2<f32>(vec2<u32>(gid.x, gid.y));
-  let psi = field_phase(p) + key_of(cells[i].color);
-  let mode = u32(fp.misc.y);
-  var d = phase_dir(psi);
-  if (mode == 1u) {
-    // 相位选轴 + 奇偶定向：纯相位会让相邻格子同向 → 配不成互愿对；
-    // 这里用相位选轴(x/y)，用 (x+y)&1 的奇偶选符号，保证反向成对。
-    // 注意：奇偶必须用 (x+y)，用索引奇偶会在 y 方向（W 为偶数）失效。
-    let even = ((gid.x + gid.y) & 1u) == 0u;
-    if (phase_axis(psi) == 0u) { d = select(2u, 0u, even); }
-    else                       { d = select(3u, 1u, even); }
-  }
-  cells[i].dir = d;
+  cells[i].stage = cells[i].color;                 // 默认不动
+  cells[i].swapped = 0u;
 
-  let q = vec2<i32>(gid.xy) + dir_offset(d);
-  if (q.x < 0 || q.y < 0 || q.x >= i32(gw()) || q.y >= i32(gh())) {
-    cells[i].nbr = INVALID; cells[i].state = ST_NOPE; cells[i].wish = INVALID;
-    return;
-  }
-  let j = idx(u32(q.x), u32(q.y));
-  if (cells[j].cmd == CMD_NOPE) {          // 那个方向没有信号
-    cells[i].nbr = INVALID; cells[i].state = ST_NOPE; cells[i].wish = INVALID;
-    return;
-  }
-  cells[i].nbr = j;
-  cells[i].state = ST_CAND;
-}
+  if (cells[i].cmd == CMD_NOPE) { return; }        // 无信号格不参与
 
-// pass_DELTA：与该方向相邻的元素比较差值，结果记录在自己的 delta 里
-@compute @workgroup_size(8, 8)
-fn pass_DELTA(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= gw() || gid.y >= gh()) { return; }
-  let i = idx(gid.x, gid.y);
-  if (cells[i].state != ST_CAND) { return; }
-  let p = vec2<f32>(vec2<u32>(gid.x, gid.y));
-  let ki = key_of(cells[i].color);
+  // 帧号决定轴：misc.w = 0 → X，1 → Y
+  let axis = u32(fp.misc.w);
+  let t = select(gid.y, gid.x, axis == 0u);
+  let even = (t & 1u) == 0u;
 
-  if (fp.misc.y > 1.5) {
-    // 最优邻格：一个 pass 内算 4 个方向取最优（等价于 4 轮，但只花 1 个 pass）
-    var best  = -1e9;
-    var bestJ = INVALID;
-    var bestD = cells[i].dir;
-    for (var d = 0u; d < 4u; d = d + 1u) {
-      let q = vec2<i32>(gid.xy) + dir_offset(d);
-      if (q.x < 0 || q.y < 0 || q.x >= i32(gw()) || q.y >= i32(gh())) { continue; }
-      let j = idx(u32(q.x), u32(q.y));
-      if (cells[j].cmd == CMD_NOPE) { continue; }
-      let pj = vec2<f32>(vec2<u32>(u32(q.x), u32(q.y)));
-      let g = swap_gain(ki, key_of(cells[j].color), p, pj);
-      if (g > best) { best = g; bestJ = j; bestD = d; }
-    }
-    cells[i].delta = best;
-    cells[i].nbr   = bestJ;
-    cells[i].dir   = bestD;
-    if (bestJ == INVALID) { cells[i].state = ST_NOPE; }
-    return;
-  }
+  var nbr = vec2<i32>(gid.xy);
+  if (axis == 0u) { nbr.x = nbr.x + select(-1, 1, even); }
+  else            { nbr.y = nbr.y + select(-1, 1, even); }
 
-  // 相位扇区/相位选轴：只与所选方向的邻居比较
-  let j = cells[i].nbr;
-  if (j == INVALID) { cells[i].state = ST_NOPE; return; }
-  let pj = vec2<f32>(vec2<u32>(j % gw(), j / gw()));
-  cells[i].delta = swap_gain(ki, key_of(cells[j].color), p, pj);
-}
+  if (nbr.x < 0 || nbr.y < 0 || nbr.x >= i32(gw()) || nbr.y >= i32(gh())) { return; }
+  let j = idx(u32(nbr.x), u32(nbr.y));
+  if (cells[j].cmd == CMD_NOPE) { return; }        // 对侧无信号也不换
 
-// pass_WISH：确认是 NOPE 还是 REQ_SWAP（发起请求就写 wish）
-@compute @workgroup_size(8, 8)
-fn pass_WISH(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= gw() || gid.y >= gh()) { return; }
-  let i = idx(gid.x, gid.y);
-  if (cells[i].state != ST_CAND) {
-    cells[i].wish  = INVALID;
-    cells[i].state = ST_NOPE;
-    return;
-  }
-  if (cells[i].delta > fp.misc.x) {          // gain ε 门限
-    cells[i].wish  = cells[i].nbr;
-    cells[i].state = ST_REQ;
-  } else {
-    cells[i].wish  = INVALID;
-    cells[i].state = ST_NOPE;
+  let pi = vec2<f32>(gid.xy);
+  let pj = vec2<f32>(vec2<u32>(u32(nbr.x), u32(nbr.y)));
+  let g = swap_gain(key_of(cells[i].color), key_of(cells[j].color), pi, pj);
+
+  if (g > fp.misc.x) {
+    cells[i].stage = cells[j].color;               // 记下要换成的值（旧值，安全）
+    cells[i].swapped = 1u;
   }
 }
 
-// ========================================================
-//  处理阶段
-// ========================================================
-
-// pass_RDIR：解析收到的请求——谁的 wish 指向我，它在哪个方向
+// Pass 2：提交（只写自己）
 @compute @workgroup_size(8, 8)
-fn pass_RDIR(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn pass_COMMIT(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= gw() || gid.y >= gh()) { return; }
   let i = idx(gid.x, gid.y);
-  cells[i].in_dir  = INVALID;
-  cells[i].partner = INVALID;
-  if (cells[i].cmd == CMD_NOPE) { return; }
-
-  var fallback    = INVALID;
-  var fallbackDir = INVALID;
-  for (var d = 0u; d < 4u; d = d + 1u) {
-    let q = vec2<i32>(gid.xy) + dir_offset(d);
-    if (q.x < 0 || q.y < 0 || q.x >= i32(gw()) || q.y >= i32(gh())) { continue; }
-    let j = idx(u32(q.x), u32(q.y));
-    if (cells[j].cmd == CMD_NOPE) { continue; }
-    if (cells[j].wish != i) { continue; }        // j 没有请求我
-    if (fallback == INVALID) { fallback = j; fallbackDir = d; }
-    if (cells[i].wish == j) {                    // 互愿，直接锁定
-      cells[i].partner = j;
-      cells[i].in_dir  = d;
-      return;
-    }
-  }
-  cells[i].partner = fallback;
-  cells[i].in_dir  = fallbackDir;
-}
-
-// pass_PROCWISH：读对方的 wish 判定互愿；互愿则暂存对方旧 color（此刻尚无并发写）
-@compute @workgroup_size(8, 8)
-fn pass_PROCWISH(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= gw() || gid.y >= gh()) { return; }
-  let i = idx(gid.x, gid.y);
-  cells[i].stage = vec4<f32>(0.0);
-  let p = cells[i].partner;
-  if (p == INVALID) { return; }
-  if (cells[p].wish != i) { return; }   // 对方并不想和我交换
-  if (cells[i].wish != p) { return; }   // 我想的不是它
-  cells[i].stage = cells[p].color;
-}
-
-// pass_SWAPWISH：提交交换（只写不读，避免写后读竞争）
-@compute @workgroup_size(8, 8)
-fn pass_SWAPWISH(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= gw() || gid.y >= gh()) { return; }
-  let i = idx(gid.x, gid.y);
-  let p = cells[i].partner;
-  if (p == INVALID) { return; }
-  if (cells[p].wish != i || cells[i].wish != p) { return; }
   cells[i].color = cells[i].stage;
-  cells[i].state = ST_DONE;
 }
 `;
 
@@ -467,28 +311,17 @@ fn pass_SWAPWISH(@builtin(global_invocation_id) gid: vec3<u32>) {
 //  WGSL: render（4 个视图，共用同一份 cell buffer）
 //    fs       像素图     —— color.rgb
 //    fs_phase 位置相位场 —— field_phase(p)（相位属于 position）
-//    fs_req   请求图     —— 协议状态
-//    fs_pair  配对成功图 —— 成功配对（同对同色）
+//    fs_req   决策图     —— 本轮 Pass1 决策（swapped）
+//    fs_pair  轴指示图   —— 当前处理轴（X/Y）
 // ========================================================
 const renderWGSL = /* wgsl */`
 const CMD_NOPE: u32 = 1u;
-const ST_CAND: u32 = 1u;
-const ST_REQ:  u32 = 2u;
-const ST_DONE: u32 = 3u;
 
 struct Cell {
-  cmd:      u32,
-  dir:      u32,
-  state:    u32,
-  wish:     u32,
-  nbr:      u32,
-  delta:    f32,
-  in_dir:   u32,
-  partner:  u32,
-  color:    vec4<f32>,
-  stage:    vec4<f32>,
-  _p0:      f32,
-  _p1:      f32,
+  cmd:      u32,       // 0=有信号 1=无信号
+  swapped:  u32,       // 本轮 Pass1 决策：是否发生交换
+  color:    vec4<f32>, // @16 交换标的物 RGBA（键由它导出）
+  stage:    vec4<f32>, // @32 暂存：Pass1 决定的新 color
 };
 
 struct RP {
@@ -560,67 +393,33 @@ fn fs_phase(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(col, 1.0);
 }
 
-// ---- 视图 3：请求图（协议状态） ----
-//   绿 = 互愿成交   红 = 被请求但没互愿   橙 = 我的请求被拒
-//   蓝灰 = 已比较未过门限   深灰 = 空闲   黑 = 无信号
-// 格子朝 wish 目标的那条边会点亮（方向刻度）
+// ---- 视图 3：决策图（本轮 Pass1 的决策） ----
+//   绿 = 决定交换（swapped）   灰 = 不动（stage==color）   黑 = NOPE
 @fragment
 fn fs_req(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
-  let dims = rp.dims.xy;
-  let cs   = rp.screen.z;
   let g = cell_at(fc);
   let c = cells[g.z];
-
-  var col = vec3<f32>(0.14, 0.14, 0.19);
   if (c.cmd == CMD_NOPE) {
-    col = vec3<f32>(0.03, 0.03, 0.05);
-  } else if (c.state == 3u) {                      // ST_DONE：互愿且完成交换
-    col = vec3<f32>(0.13, 0.92, 0.42);
-  } else if (c.state == 2u) {                      // ST_REQ：请求已发出
-    if (c.partner != 0xFFFFFFFFu) {
-      col = vec3<f32>(0.93, 0.16, 0.42);           // 我也被请求了，但没互愿
-    } else {
-      col = vec3<f32>(0.95, 0.58, 0.08);           // 我的请求被拒
-    }
-  } else if (c.state == 1u) {                      // ST_CAND：已比较、未过门限
-    col = vec3<f32>(0.20, 0.30, 0.48) + vec3<f32>(0.0, 0.15, 0.30) * clamp(abs(c.delta), 0.0, 1.0);
+    return vec4<f32>(vec3<f32>(0.03, 0.03, 0.05), 1.0);
   }
-
-  if (c.cmd != CMD_NOPE && c.state >= 2u) {
-    let lx = fract(fc.x / cs);
-    let ly = fract(fc.y / cs);
-    var tick = false;
-    if      (c.dir == 0u) { tick = lx >= 0.5; }     // +X
-    else if (c.dir == 1u) { tick = ly >= 0.5; }     // +Y
-    else if (c.dir == 2u) { tick = lx <  0.5; }     // -X
-    else                  { tick = ly <  0.5; }     // -Y
-    if (tick) { col = mix(col, vec3<f32>(1.0), 0.7); }
-  }
+  let changed = c.swapped == 1u;
+  var col = vec3<f32>(0.15, 0.15, 0.20);
+  if (changed) { col = vec3<f32>(0.20, 0.95, 0.40); }
   return vec4<f32>(col, 1.0);
 }
 
-// ---- 视图 4：配对成功图（本轮互愿成交的配对） ----
-// 同一对用同一个颜色（按对 id 哈希），可以直接看出谁跟谁配上了
+// ---- 视图 4：轴指示图 ----
+//   底色随本帧轴（X=蓝 / Y=橙），发生交换的格子更亮
 @fragment
 fn fs_pair(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let g = cell_at(fc);
   let c = cells[g.z];
-
-  var col = vec3<f32>(0.09, 0.09, 0.12);
-  if (c.cmd != CMD_NOPE && c.state == ST_DONE && c.partner != 0xFFFFFFFFu) {
-    let pid = min(g.z, c.partner);                // 配对 id：两端取小
-    col = 0.35 + 0.65 * hue2rgb(hash01(pid));
-    // 刻度：朝伙伴的那条边更亮
-    let cs = rp.screen.z;
-    let lx = fract(fc.x / cs);
-    let ly = fract(fc.y / cs);
-    var tick = false;
-    if      (c.dir == 0u) { tick = lx >= 0.5; }
-    else if (c.dir == 1u) { tick = ly >= 0.5; }
-    else if (c.dir == 2u) { tick = lx <  0.5; }
-    else                  { tick = ly <  0.5; }
-    if (tick) { col = mix(col, vec3<f32>(1.0), 0.55); }
+  if (c.cmd == CMD_NOPE) {
+    return vec4<f32>(vec3<f32>(0.05, 0.05, 0.07), 1.0);
   }
+  let axis = u32(rp.screen.w);
+  var col = select(vec3<f32>(0.15, 0.25, 0.55), vec3<f32>(0.55, 0.35, 0.15), axis == 1u);
+  if (c.swapped == 1u) { col = col * 1.6; }
   return vec4<f32>(col, 1.0);
 }
 `;
@@ -664,12 +463,8 @@ const rendLayout = device.createPipelineLayout({ bindGroupLayouts: [rendBGL] });
 
 // 用 error scope 捕获 pipeline 校验错误，避免它们退化成 submit 时的 CommandBuffer 报错
 device.pushErrorScope('validation');
-const pDir      = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_DIR' } });
-const pDelta    = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_DELTA' } });
-const pWish     = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_WISH' } });
-const pRdir     = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_RDIR' } });
-const pProcWish = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_PROCWISH' } });
-const pSwapWish = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_SWAPWISH' } });
+const pDecide = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_DECIDE' } });
+const pCommit = device.createComputePipeline({ layout: compLayout, compute: { module: compMod, entryPoint: 'pass_COMMIT' } });
 
 const mkRenderPipe = (entry) => device.createRenderPipeline({
   layout: rendLayout,
@@ -701,7 +496,7 @@ const rendBG = device.createBindGroup({
 window.__dbg = {
   device, cellBuf, W, H, CELL_WORDS,
   frameNo: () => frameNo,
-  field: () => ({ t: tAcc, perX: +ui.px.value, perY: +ui.py.value, eps: +ui.eps.value, mode: +ui.dmode.value }),
+  field: () => ({ t: tAcc, perX: +ui.px.value, perY: +ui.py.value, eps: +ui.eps.value, axis: currentAxis }),
 };  // 调试用：允许外部读回 buffer
 
 // ===== UI =====
@@ -711,7 +506,6 @@ const ui = {
   rnd:   document.getElementById('rnd'),
   px:    document.getElementById('px'),
   py:    document.getElementById('py'),
-  dmode: document.getElementById('dmode'),
   kmode: document.getElementById('kmode'),
   pause: document.getElementById('pause'),
   step:  document.getElementById('step'),
@@ -742,7 +536,7 @@ ui.reset.onclick = () => { initCells(); tAcc = 0; frameNo = 0; };
 const FP = new ArrayBuffer(64);
 const fpU = new Uint32Array(FP);
 const fpF = new Float32Array(FP);
-function writeField(t, perX, perY, eps, dirMode, keyMode) {
+function writeField(t, perX, perY, eps, axis, keyMode) {
   fpU[0] = W; fpU[1] = H; fpU[2] = 0; fpU[3] = 0;
   fpF[4] = wrapTau(t);
   fpF[5] = 2 * Math.PI / perX;   // kx
@@ -750,14 +544,16 @@ function writeField(t, perX, perY, eps, dirMode, keyMode) {
   fpF[7] = 0;
   fpF[8] = 1;                   // 相位图增益
   fpF[12] = eps;                // gain ε
-  fpF[13] = dirMode;            // 0=相位扇区 1=相位选轴 2=最优邻格
+  fpF[13] = 0;                  // 原 dirMode，2-pass 协议不再使用
   fpF[14] = keyMode;            // 0=颜色明度 1=颜色色相
+  fpF[15] = axis;               // 0=X 1=Y（由帧号决定）
   device.queue.writeBuffer(fpBuf, 0, FP);
 }
 
 // ===== 主循环 =====
 let tAcc = 0;
 let frameNo = 0;
+let currentAxis = 1;        // 当前处理轴：0=X 1=Y，逐帧交替，保证两轴都被处理
 let lastTime = performance.now();
 let fpsAcc = 0, fpsCount = 0;
 
@@ -805,32 +601,27 @@ function frame() {
   const eps  = +ui.eps.value;
   const perX = +ui.px.value, perY = +ui.py.value;
   const rounds  = +ui.rnd.value;
-  const dirMode = +ui.dmode.value;
   const keyMode = +ui.kmode.value;
 
-  writeField(tAcc, perX, perY, eps, dirMode, keyMode);
-  writeRP(tAcc, perX, perY);
+  const axis = currentAxis;        // 单帧只处理一个轴，逐帧交替 X/Y
+  writeField(tAcc, perX, perY, eps, axis, keyMode);
+  writeRP(tAcc, perX, perY, axis);
 
   const enc = device.createCommandEncoder();
 
   if (advance) {
     frameNo++;
     for (let r = 0; r < rounds; r++) {
-      // 请求阶段
-      dispatch(enc, pDir);
-      dispatch(enc, pDelta);
-      dispatch(enc, pWish);
-      // 处理阶段
-      dispatch(enc, pRdir);
-      dispatch(enc, pProcWish);
-      dispatch(enc, pSwapWish);
+      dispatch(enc, pDecide);      // Pass1 决策
+      dispatch(enc, pCommit);      // Pass2 提交
     }
+    currentAxis = 1 - currentAxis;   // 下一帧切到另一轴，保证 X、Y 都被处理
   }
 
   drawView(enc, pix.cx,  pipePix);    // 像素图
   drawView(enc, phase.cx, pipePh);    // 相位图
-  drawView(enc, req.cx,   pipeReq);   // 请求图
-  drawView(enc, pair.cx,  pipePair);  // 配对成功图
+  drawView(enc, req.cx,   pipeReq);   // 决策图
+  drawView(enc, pair.cx,  pipePair);  // 轴指示图
 
   device.queue.submit([enc.finish()]);
 }
