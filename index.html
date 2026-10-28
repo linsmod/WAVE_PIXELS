@@ -46,9 +46,9 @@
   <label>Speed <span id="spdV">1.00</span><input id="spd" type="range" min="0" max="3" step="0.05" value="1"></label>
   <label>Rounds/frame <span id="rndV">1</span><input id="rnd" type="range" min="1" max="4" step="1" value="1"></label>
   <label>Steps/sec <span id="spsV">60</span><input id="sps" type="range" min="1" max="144" step="1" value="60"></label>
-  <label>Period X <span id="pxV">16</span><input id="px" type="range" min="6" max="48" step="1" value="16"></label>
-  <label>Period Y <span id="pyV">20</span><input id="py" type="range" min="6" max="48" step="1" value="20"></label>
-  <label>键源 <select id="kmode"><option value="0" selected>颜色明度</option><option value="1">颜色色相</option></select></label>
+  <label>Period X <span id="pxV">128</span><input id="px" type="range" min="32" max="512" step="1" value="128"></label>
+  <label>Period Y <span id="pyV">128</span><input id="py" type="range" min="32" max="512" step="1" value="128"></label>
+  <label>Pixel comparison <select id="kmode"><option value="0" selected>颜色明度</option><option value="1">颜色色相</option><option value="2">灰度</option></select></label>
   <div class="row"><button id="pause">Pause</button><button id="step">Step</button><button id="reset">Reset</button></div>
   <div id="fps">FPS: --</div>
 </div>
@@ -87,7 +87,7 @@ const req   = mkCanvas('creq');    // 请求图
 const pair  = mkCanvas('cpair');   // 配对成功图
 
 // ===== 尺寸 =====
-const W = 32, H = 32;
+const W = 128, H = 128;
 const TOTAL = W * H;
 const CELL_WORDS = 8;           // 8 * 4B = 32B / cell (swapped@0, color@16)
 const REZ = 512;
@@ -212,8 +212,14 @@ fn field_phase(p: vec2<f32>) -> f32 {
 // 颜色 → 排序键 ∈ [0, 2π)
 //   key_mode=0：明度 luma ∈ [0,1] → [0,2π)
 //   key_mode=1：色相 hue ∈ [0,1) → [0,2π)
+// 颜色 → 排序键 ∈ [0, 2π)
+//   key_mode=0：明度 luma ∈ [0,1] → [0,2π)
+//   key_mode=1：色相 hue ∈ [0,1) → [0,2π)
+//   key_mode=2：灰度 gray ∈ [0,1] → [0,2π)
 fn key_of(c: vec4<f32>) -> f32 {
-  if (fp.misc.z > 0.5) {
+  let mode = u32(fp.misc.z);
+  
+  if (mode == 1u) {
     // 标准 RGB→HSV 色相角
     let mx = max(c.r, max(c.g, c.b));
     let mn = min(c.r, min(c.g, c.b));
@@ -226,8 +232,15 @@ fn key_of(c: vec4<f32>) -> f32 {
     h = h / 6.0;
     if (h < 0.0) { h = h + 1.0; }
     return h * 6.2831853;
+  } 
+  
+  if (mode == 2u) {
+    // 灰度（算术平均）或者你可以用最标准的 (R+G+B)/3
+    let gray = (c.r + c.g + c.b) / 3.0;
+    return clamp(gray, 0.0, 1.0) * 6.2831853;
   }
-  // Rec.709 明度
+  
+  // mode == 0：Rec.709 明度（加权平均）
   let luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
   return clamp(luma, 0.0, 1.0) * 6.2831853;
 }
@@ -376,8 +389,10 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 fn fs_phase(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let g = cell_at(fc);
   let p = vec2<f32>(vec2<u32>(g.x, g.y));
-  let col = hue2rgb(fract(field_phase(p) / 6.2831853));
-  return vec4<f32>(col, 1.0);
+  // let col = hue2rgb(fract(field_phase(p) / 6.2831853));
+  // return vec4<f32>(col, 1.0);
+    let v = (sin(field_phase(p)) + 1.0) * 0.5;
+  return vec4<f32>(v, v, v, 1.0);
 }
 
 // ---- 视图 3：决策图（本轮是否交换） ----
