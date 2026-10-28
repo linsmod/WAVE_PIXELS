@@ -246,28 +246,35 @@ fn swap_gain(ki: f32, kj: f32,
 
 // ========================================================
 //  1-Pass 协议（单趟完成）
-//    帧号决定轴（misc.w=0→X，1→Y）。
-//    仅「位置单数」像素作为裁决者（X 轴看 x 奇偶、Y 轴看 y 奇偶），
-//    朝 -axis 方向配对唯一偶数伙伴 → 对称谓词使整对同换同不换。
+//    帧号决定轴（misc.w=0→X，1→Y）与匹配相位（misc.y=0 偶相位 / 1 奇相位）。
+//    由 flip 决定「哪一侧坐标单数像素当裁决者」，从而切换两种相邻匹配，
+//    覆盖全部 (2k,2k+1) 与 (2k+1,2k+2) 相邻对 → 对称谓词使整对同换同不换。
 //    裁决者独占读写该对的两个 color（无跨线程竞争），
 //    故无需 stage 中转、也无需第二趟提交。
 // ========================================================
 
-// 单 Pass 交换：仅位置单数像素当裁决者，独占读写它那一对的两个 color
+// 单 Pass 交换：由 flip 决定「谁当裁决者」，从而切换两种匹配、覆盖全部相邻对。
+//   flip=0 → 偶相位匹配 (0,1)(2,3)…（奇数位像素发起，朝 -axis 找偶数伙伴）
+//   flip=1 → 奇相位匹配 (1,2)(3,4)…（偶数位像素发起，朝 -axis 找奇数伙伴）
+// 每格 color 仍只被唯一一个裁决者读写 → 无竞争；奇相位时轴端点会越界→跳过（边界格不交换）。
 @compute @workgroup_size(8, 8)
 fn pass_SWAP(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= gw() || gid.y >= gh()) { return; }
   let i = idx(gid.x, gid.y);
 
   let axis = u32(fp.misc.w);
-  // 仅坐标单数的像素是裁决者：X 轴看 x 奇偶，Y 轴看 y 奇偶
-  let isDecider = select((gid.y & 1u) == 1u, (gid.x & 1u) == 1u, axis == 0u);
-  if (!isDecider) { return; }                      // 偶数像素为被动伙伴，由裁决者替它换
+  let flip = fp.misc.y > 0.5;
 
-  // 单数像素必有一个 -axis 方向的偶数邻居（x-1 / y-1 恒 >= 0）
+  // 沿轴坐标是否单数；flip 反转发起方 → 切换两种匹配，覆盖全部相邻对
+  let oddA = select((gid.y & 1u) == 1u, (gid.x & 1u) == 1u, axis == 0u);
+  let isDecider = (oddA != flip);
+  if (!isDecider) { return; }                      // 被动伙伴，由裁决者替它换
+
+  // 裁决者朝 -axis 方向找伙伴
   var nbr = vec2<i32>(gid.xy);
   if (axis == 0u) { nbr.x = nbr.x - 1; }
   else            { nbr.y = nbr.y - 1; }
+  if (nbr.x < 0 || nbr.y < 0 || nbr.x >= i32(gw()) || nbr.y >= i32(gh())) { return; }
   let j = idx(u32(nbr.x), u32(nbr.y));
 
   // 先把双方旧 color 读进局部变量，再交换 —— 每格 color 仅由本裁决者读写，无竞争
@@ -474,7 +481,7 @@ const rendBG = device.createBindGroup({
 window.__dbg = {
   device, cellBuf, W, H, CELL_WORDS,
   frameNo: () => frameNo,
-  field: () => ({ t: tAcc, perX: +ui.px.value, perY: +ui.py.value, eps: +ui.eps.value, axis: currentAxis }),
+  field: () => ({ t: tAcc, perX: +ui.px.value, perY: +ui.py.value, eps: +ui.eps.value, axis: swpStep & 1, flip: (swpStep >> 1) & 1 }),
 };  // 调试用：允许外部读回 buffer
 
 // ===== UI =====
@@ -514,7 +521,7 @@ ui.reset.onclick = () => { initCells(); tAcc = 0; frameNo = 0; };
 const FP = new ArrayBuffer(64);
 const fpU = new Uint32Array(FP);
 const fpF = new Float32Array(FP);
-function writeField(t, perX, perY, eps, axis, keyMode) {
+function writeField(t, perX, perY, eps, axis, keyMode, flip) {
   fpU[0] = W; fpU[1] = H; fpU[2] = 0; fpU[3] = 0;
   fpF[4] = wrapTau(t);
   fpF[5] = 2 * Math.PI / perX;   // kx
@@ -522,7 +529,7 @@ function writeField(t, perX, perY, eps, axis, keyMode) {
   fpF[7] = 0;
   fpF[8] = 1;                   // 相位图增益
   fpF[12] = eps;                // gain ε
-  fpF[13] = 0;                  // 原 dirMode，2-pass 协议不再使用
+  fpF[13] = flip;               // 0=偶相位匹配 1=奇相位匹配（覆盖互补相邻对）
   fpF[14] = keyMode;            // 0=颜色明度 1=颜色色相
   fpF[15] = axis;               // 0=X 1=Y（由帧号决定）
   device.queue.writeBuffer(fpBuf, 0, FP);
@@ -531,7 +538,7 @@ function writeField(t, perX, perY, eps, axis, keyMode) {
 // ===== 主循环 =====
 let tAcc = 0;
 let frameNo = 0;
-let currentAxis = 1;        // 当前处理轴：0=X 1=Y，逐帧交替，保证两轴都被处理
+let swpStep = 0;            // 0:X偶 1:Y偶 2:X奇 3:Y奇，逐帧循环覆盖全部相邻对
 let lastTime = performance.now();
 let fpsAcc = 0, fpsCount = 0;
 
@@ -581,8 +588,10 @@ function frame() {
   const rounds  = +ui.rnd.value;
   const keyMode = +ui.kmode.value;
 
-  const axis = currentAxis;        // 单帧只处理一个轴，逐帧交替 X/Y
-  writeField(tAcc, perX, perY, eps, axis, keyMode);
+  // 4 态循环：轴(X/Y) × 匹配相位(偶/奇)，覆盖全部相邻对
+  const axis = swpStep & 1;             // 0=X 1=Y
+  const flip = (swpStep >> 1) & 1;      // 0=偶相位 1=奇相位
+  writeField(tAcc, perX, perY, eps, axis, keyMode, flip);
   writeRP(tAcc, perX, perY, axis);
 
   const enc = device.createCommandEncoder();
@@ -592,7 +601,7 @@ function frame() {
     for (let r = 0; r < rounds; r++) {
       dispatch(enc, pSwap);        // 单趟交换
     }
-    currentAxis = 1 - currentAxis;   // 下一帧切到另一轴，保证 X、Y 都被处理
+    swpStep++;   // 下一帧切到 (轴, 匹配相位) 的下一态
   }
 
   drawView(enc, pix.cx,  pipePix);    // 像素图
