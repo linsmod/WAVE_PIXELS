@@ -25,6 +25,8 @@
   #hud button:hover{background:#253060}
   #hud .row{display:flex;gap:6px;margin-top:8px}
   #fps{color:#6f6;font-size:11px;margin-top:6px}
+  .wave-control{margin-top:8px;padding:6px;background:rgba(20,25,45,.6);border-radius:4px;border:1px solid #223}
+  .wave-control label{margin-bottom:2px}
   /* 四视图：紧凑 2×2。方格边长由 JS 按可用空间算出（见 fitStage），
      轨道也用固定像素，避免 1fr 把两张图推到各自半区中心而"散开" */
   #stage{flex:1 1 auto;display:grid;min-width:0;min-height:0;
@@ -46,8 +48,22 @@
   <label>Speed <span id="spdV">1.00</span><input id="spd" type="range" min="0" max="3" step="0.05" value="1"></label>
   <label>Rounds/frame <span id="rndV">1</span><input id="rnd" type="range" min="1" max="4" step="1" value="1"></label>
   <label>Steps/sec <span id="spsV">60</span><input id="sps" type="range" min="1" max="144" step="1" value="60"></label>
-  <label>Period X <span id="pxV">128</span><input id="px" type="range" min="32" max="512" step="1" value="128"></label>
-  <label>Period Y <span id="pyV">128</span><input id="py" type="range" min="32" max="512" step="1" value="128"></label>
+  <label>Wave count <span id="waveCountV">2</span><input id="waveCount" type="range" min="1" max="4" step="1" value="2"></label>
+  <div class="row">
+    <button id="preset1">单波</button>
+    <button id="preset2">垂直双波</button>
+    <button id="preset3">45°干涉</button>
+    <button id="preset4">三波</button>
+    <button id="preset5">四波</button>
+  </div>
+  <div id="waveControls">
+    <div class="wave-control" data-wave="0">
+      <label>Wave 1 PerX <span id="w0_pxV">128</span><input id="w0_px" type="range" min="32" max="512" step="1" value="128"></label>
+      <label>Wave 1 PerY <span id="w0_pyV">128</span><input id="w0_py" type="range" min="32" max="512" step="1" value="128"></label>
+      <label>Wave 1 Amp <span id="w0_ampV">1.0</span><input id="w0_amp" type="range" min="0" max="2" step="0.1" value="1"></label>
+      <label>Wave 1 Speed <span id="w0_spdV">1.0</span><input id="w0_spd" type="range" min="0" max="3" step="0.1" value="1"></label>
+    </div>
+  </div>
   <label>Pixel comparison <select id="kmode"><option value="0" selected>颜色明度</option><option value="1">颜色色相</option><option value="2">灰度</option></select></label>
   <div class="row"><button id="pause">Pause</button><button id="step">Step</button><button id="reset">Reset</button></div>
   <div id="fps">FPS: --</div>
@@ -156,29 +172,73 @@ function initCells() {
 initCells();
 
 // ===== Field uniform =====
-const fpBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+// 扩展以支持最多 4 个波分量：每个波需要 (t, kx, ky, _) = 16B
+// 总大小：dims(16B) + 4 * wave(16B) + phase(16B) + misc(16B) = 128B
+const fpBuf = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
 // ===== Render uniform =====
 // 追加 wave(t,kx,ky)，让渲染侧也能算出「位置相位」（相位属于 position）
-const rpBuf = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-const RP = new ArrayBuffer(48);
+// 扩展以支持最多 4 个波分量：每个波需要 (t, kx, ky, amplitude) = 16B
+// 总大小：dims(16B) + screen(16B) + 4 * wave(16B) + phase(16B) + misc(16B) = 128B
+const rpBuf = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const RP = new ArrayBuffer(128);
 const rpU = new Uint32Array(RP);
 const rpF = new Float32Array(RP);
-function writeRP(t, perX, perY, axis) {
+function writeRP(t, waves, axis) {
   rpU[0] = W; rpU[1] = H; rpU[2] = 0; rpU[3] = 0;
   rpF[4] = REZ; rpF[5] = REZ; rpF[6] = REZ / W; rpF[7] = axis;   // screen.w 传当前轴给渲染侧
-  rpF[8] = wrapTau(t);
-  rpF[9] = 2 * Math.PI / perX;                 // kx
-  rpF[10] = 2 * Math.PI / perY;                // ky
-  rpF[11] = 0;
+
+  let totalAmp = 0;
+  // 写入 4 个波分量
+  for (let i = 0; i < 4; i++) {
+    const offset = 8 + i * 4;
+    if (i < waves.length) {
+      const w = waves[i];
+      rpF[offset + 0] = wrapTau(t * w.speed);       // t * speed
+      rpF[offset + 1] = 2 * Math.PI / w.perX;       // kx
+      rpF[offset + 2] = 2 * Math.PI / w.perY;       // ky
+      rpF[offset + 3] = w.amp;                      // amplitude
+      totalAmp += w.amp;
+    } else {
+      rpF[offset + 0] = 0;
+      rpF[offset + 1] = 0;
+      rpF[offset + 2] = 0;
+      rpF[offset + 3] = 0;
+    }
+  }
+
+  rpF[24] = 1;                   // 相位图增益
+  rpF[25] = waves.length;       // wave_count
+  rpF[26] = totalAmp;           // 总振幅（归一化干涉场用，映射到 [0,1]）
+  rpF[27] = 0;
+  rpF[28] = 0;
+  rpF[29] = 0;
+  rpF[30] = 0;
+  rpF[31] = 0;
   device.queue.writeBuffer(rpBuf, 0, RP);
 }
-writeRP(0, 16, 20, 1);
+writeRP(0, [{speed: 1, perX: 128, perY: 128, amp: 1}], 1);
 
 const fieldPhase=(vk) =>`
 fn field_phase(p: vec2<f32>) -> f32 {
-  let w = ${vk}.wave;
-  return w.y * p.x + w.z * p.y + w.x;
+  var acc = 0.0;
+
+  // 关键：对每一波「单独取 sin 再求和」，而不是先把线性相位相加再取 sin。
+  // 多个线性相位相加仍是一个线性方向 → 永远只是条纹；
+  // 各波正弦值相加才是真正的波叠加/干涉，垂直方向的两波才能形成格子。
+  let w0 = ${vk}.wave0;
+  acc += w0.w * sin(w0.y * p.x + w0.z * p.y + w0.x);
+
+  let w1 = ${vk}.wave1;
+  acc += w1.w * sin(w1.y * p.x + w1.z * p.y + w1.x);
+
+  let w2 = ${vk}.wave2;
+  acc += w2.w * sin(w2.y * p.x + w2.z * p.y + w2.x);
+
+  let w3 = ${vk}.wave3;
+  acc += w3.w * sin(w3.y * p.x + w3.z * p.y + w3.x);
+
+  return acc;
 }
 `;
 
@@ -197,10 +257,13 @@ struct Cell {
 };
 
 struct FieldParams {
-  dims:  vec4<u32>, // W, H, _, _
-  wave:  vec4<f32>, // t, kx, ky, _
-  phase: vec4<f32>, // (相位图增益), _, _, _
-  misc:  vec4<f32>, // gain_eps, _, key_mode(0=明度,1=色相), axis(0=X,1=Y)
+  dims:  vec4<u32>,       // W, H, _, _
+  wave0: vec4<f32>,      // 波0: t, kx, ky, amplitude
+  wave1: vec4<f32>,      // 波1: t, kx, ky, amplitude
+  wave2: vec4<f32>,      // 波2: t, kx, ky, amplitude
+  wave3: vec4<f32>,      // 波3: t, kx, ky, amplitude
+  phase: vec4<f32>,      // (相位图增益), _, _, _
+  misc:  vec4<f32>,      // gain_eps, flip, key_mode(0=明度,1=色相), axis(0=X,1=Y)
 };
 
 @group(0) @binding(0) var<storage, read_write> cells: array<Cell>;
@@ -328,9 +391,14 @@ struct Cell {
 };
 
 struct RP {
-  dims:   vec4<u32>, // W, H, _, _
-  screen: vec4<f32>, // REZ, REZ, cellSize, _
-  wave:   vec4<f32>, // t, kx, ky, _
+  dims:   vec4<u32>,       // W, H, _, _
+  screen: vec4<f32>,      // REZ, REZ, cellSize, _
+  wave0:  vec4<f32>,      // 波0: t, kx, ky, amplitude
+  wave1:  vec4<f32>,      // 波1: t, kx, ky, amplitude
+  wave2:  vec4<f32>,      // 波2: t, kx, ky, amplitude
+  wave3:  vec4<f32>,      // 波3: t, kx, ky, amplitude
+  phase:  vec4<f32>,      // (相位图增益), wave_count, _, _
+  misc:   vec4<f32>,      // _, _, _, _
 };
 
 @group(0) @binding(0) var<storage, read> cells: array<Cell>;
@@ -388,9 +456,11 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 fn fs_phase(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
   let g = cell_at(fc);
   let p = vec2<f32>(vec2<u32>(g.x, g.y));
-  // let col = hue2rgb(fract(field_phase(p) / 6.2831853));
-  // return vec4<f32>(col, 1.0);
-    let v = (sin(field_phase(p)) + 1.0) * 0.5;
+  // field_phase 已是各波正弦的叠加（干涉场，范围约 [-Σamp, Σamp]），
+  // 直接按总振幅归一化即可看到格子/干涉图样，不要再套一层 sin（那会重新变回条纹）。
+  let phase = field_phase(p);
+  let amp = max(rp.phase.z, 1e-3);
+  let v = clamp(phase / amp * 0.5 + 0.5, 0.0, 1.0);
   return vec4<f32>(v, v, v, 1.0);
 }
 
@@ -496,7 +566,7 @@ const rendBG = device.createBindGroup({
 window.__dbg = {
   device, cellBuf, W, H, CELL_WORDS,
   frameNo: () => frameNo,
-  field: () => ({ t: tAcc, perX: +ui.px.value, perY: +ui.py.value, eps: +ui.eps.value, axis: swpStep & 1, flip: (swpStep >> 1) & 1 }),
+  field: () => ({ t: tAcc, waves: getWaves(), eps: +ui.eps.value, axis: swpStep & 1, flip: (swpStep >> 1) & 1 }),
 };  // 调试用：允许外部读回 buffer
 
 // ===== UI =====
@@ -504,10 +574,9 @@ const ui = {
   eps:   document.getElementById('eps'),
   spd:   document.getElementById('spd'),
   rnd:   document.getElementById('rnd'),
-  px:    document.getElementById('px'),
-  py:    document.getElementById('py'),
   kmode: document.getElementById('kmode'),
   sps:   document.getElementById('sps'),
+  waveCount: document.getElementById('waveCount'),
   pause: document.getElementById('pause'),
   step:  document.getElementById('step'),
   reset: document.getElementById('reset'),
@@ -515,12 +584,117 @@ const ui = {
   hud:   document.getElementById('hud'),
   h1:    document.getElementById('h1'),
 };
-ui.eps.oninput   = () => document.getElementById('epsV').textContent = (+ui.eps.value).toFixed(3);
-ui.spd.oninput   = () => document.getElementById('spdV').textContent = (+ui.spd.value).toFixed(2);
-ui.rnd.oninput   = () => document.getElementById('rndV').textContent = ui.rnd.value;
-ui.sps.oninput   = () => document.getElementById('spsV').textContent = ui.sps.value;
-ui.px.oninput    = () => document.getElementById('pxV').textContent = ui.px.value;
-ui.py.oninput    = () => document.getElementById('pyV').textContent = ui.py.value;
+ui.eps.oninput     = () => document.getElementById('epsV').textContent = (+ui.eps.value).toFixed(3);
+ui.spd.oninput     = () => document.getElementById('spdV').textContent = (+ui.spd.value).toFixed(2);
+ui.rnd.oninput     = () => document.getElementById('rndV').textContent = ui.rnd.value;
+ui.sps.oninput     = () => document.getElementById('spsV').textContent = ui.sps.value;
+ui.waveCount.oninput = () => {
+  const count = +ui.waveCount.value;
+  document.getElementById('waveCountV').textContent = count;
+  updateWaveControls(count);
+};
+
+// 波控制面板动态更新
+function updateWaveControls(count) {
+  const container = document.getElementById('waveControls');
+  container.innerHTML = '';
+  for (let i = 0; i < count; i++) {
+    const div = document.createElement('div');
+    div.className = 'wave-control';
+    // 设置默认值让两个波有明显不同的方向和周期
+    const defaultPerX = i === 0 ? 100 : 150;
+    const defaultPerY = i === 0 ? 100 : 80;
+    const defaultAmp = 1.0;
+    const defaultSpeed = i === 0 ? 1.0 : 1.5;
+    div.innerHTML = `
+      <label>Wave ${i+1} PerX <span id="w${i}_pxV">${defaultPerX}</span><input id="w${i}_px" type="range" min="32" max="512" step="1" value="${defaultPerX}"></label>
+      <label>Wave ${i+1} PerY <span id="w${i}_pyV">${defaultPerY}</span><input id="w${i}_py" type="range" min="32" max="512" step="1" value="${defaultPerY}"></label>
+      <label>Wave ${i+1} Amp <span id="w${i}_ampV">${defaultAmp}</span><input id="w${i}_amp" type="range" min="0" max="2" step="0.1" value="${defaultAmp}"></label>
+      <label>Wave ${i+1} Speed <span id="w${i}_spdV">${defaultSpeed}</span><input id="w${i}_spd" type="range" min="0" max="3" step="0.1" value="${defaultSpeed}"></label>
+    `;
+    container.appendChild(div);
+
+    // 添加事件监听
+    document.getElementById(`w${i}_px`).oninput = () => document.getElementById(`w${i}_pxV`).textContent = document.getElementById(`w${i}_px`).value;
+    document.getElementById(`w${i}_py`).oninput = () => document.getElementById(`w${i}_pyV`).textContent = document.getElementById(`w${i}_py`).value;
+    document.getElementById(`w${i}_amp`).oninput = () => document.getElementById(`w${i}_ampV`).textContent = (+document.getElementById(`w${i}_amp`).value).toFixed(1);
+    document.getElementById(`w${i}_spd`).oninput = () => document.getElementById(`w${i}_spdV`).textContent = (+document.getElementById(`w${i}_spd`).value).toFixed(1);
+  }
+}
+
+// 从 UI 获取波参数
+function getWaves() {
+  const count = +ui.waveCount.value;
+  const waves = [];
+  for (let i = 0; i < count; i++) {
+    waves.push({
+      perX: +document.getElementById(`w${i}_px`).value,
+      perY: +document.getElementById(`w${i}_py`).value,
+      amp: +document.getElementById(`w${i}_amp`).value,
+      speed: +document.getElementById(`w${i}_spd`).value,
+    });
+  }
+  return waves;
+}
+
+// 初始化波控制
+updateWaveControls(2);  // 默认 2 个波，更容易看到干涉
+// 页面加载时自动应用垂直双波预设
+setTimeout(() => applyPreset('preset2'), 100);
+
+// 预设配置
+const presets = {
+  preset1: { count: 1, waves: [{ perX: 128, perY: 128, amp: 1.0, speed: 1.0 }] },
+  preset2: { count: 2, waves: [
+    { perX: 32, perY: 512, amp: 1.0, speed: 1.0 },   // 水平密集条纹（沿Y方向）
+    { perX: 512, perY: 32, amp: 1.0, speed: 1.0 }    // 垂直密集条纹（沿X方向）
+  ]},
+  preset3: { count: 2, waves: [
+    { perX: 100, perY: 100, amp: 1.0, speed: 1.0 },  // 45° 对角波
+    { perX: 100, perY: 100, amp: 1.0, speed: 1.5 }   // 相同方向，不同速度产生相移
+  ]},
+  preset4: { count: 3, waves: [
+    { perX: 100, perY: 100, amp: 1.0, speed: 1.0 },
+    { perX: 150, perY: 80, amp: 1.0, speed: 1.2 },
+    { perX: 80, perY: 150, amp: 1.0, speed: 0.8 }
+  ]},
+  preset5: { count: 4, waves: [
+    { perX: 100, perY: 100, amp: 1.0, speed: 1.0 },
+    { perX: 150, perY: 80, amp: 1.0, speed: 1.2 },
+    { perX: 80, perY: 150, amp: 1.0, speed: 0.8 },
+    { perX: 120, perY: 120, amp: 0.5, speed: 1.5 }
+  ]}
+};
+
+// 应用预设
+function applyPreset(presetName) {
+  const preset = presets[presetName];
+  if (!preset) return;
+
+  ui.waveCount.value = preset.count;
+  document.getElementById('waveCountV').textContent = preset.count;
+  updateWaveControls(preset.count);
+
+  // 设置每个波的参数
+  for (let i = 0; i < preset.waves.length; i++) {
+    const w = preset.waves[i];
+    document.getElementById(`w${i}_px`).value = w.perX;
+    document.getElementById(`w${i}_py`).value = w.perY;
+    document.getElementById(`w${i}_amp`).value = w.amp;
+    document.getElementById(`w${i}_spd`).value = w.speed;
+    document.getElementById(`w${i}_pxV`).textContent = w.perX;
+    document.getElementById(`w${i}_pyV`).textContent = w.perY;
+    document.getElementById(`w${i}_ampV`).textContent = w.amp.toFixed(1);
+    document.getElementById(`w${i}_spdV`).textContent = w.speed.toFixed(1);
+  }
+}
+
+// 绑定预设按钮
+document.getElementById('preset1').onclick = () => applyPreset('preset1');
+document.getElementById('preset2').onclick = () => applyPreset('preset2');
+document.getElementById('preset3').onclick = () => applyPreset('preset3');
+document.getElementById('preset4').onclick = () => applyPreset('preset4');
+document.getElementById('preset5').onclick = () => applyPreset('preset5');
 
 // 点击标题折叠/展开 HUD（折叠后只剩一个小把手，四图区变大）
 ui.h1.onclick = () => {
@@ -535,20 +709,42 @@ ui.step.onclick  = () => { stepReq = true; };
 ui.reset.onclick = () => { initCells(); tAcc = 0; frameNo = 0; };
 
 // ===== Field uniform 写入 =====
-const FP = new ArrayBuffer(64);
+const FP = new ArrayBuffer(128);
 const fpU = new Uint32Array(FP);
 const fpF = new Float32Array(FP);
-function writeField(t, perX, perY, eps, axis, keyMode, flip) {
+function writeField(t, waves, eps, axis, keyMode, flip) {
   fpU[0] = W; fpU[1] = H; fpU[2] = 0; fpU[3] = 0;
-  fpF[4] = wrapTau(t);
-  fpF[5] = 2 * Math.PI / perX;   // kx
-  fpF[6] = 2 * Math.PI / perY;   // ky
-  fpF[7] = 0;
-  fpF[8] = 1;                   // 相位图增益
-  fpF[12] = eps;                // gain ε
-  fpF[13] = flip;               // 0=偶相位匹配 1=奇相位匹配（覆盖互补相邻对）
-  fpF[14] = keyMode;            // 0=颜色明度 1=颜色色相
-  fpF[15] = axis;               // 0=X 1=Y（由帧号决定）
+
+  let totalAmp = 0;
+  // 写入 4 个波分量
+  for (let i = 0; i < 4; i++) {
+    const offset = 4 + i * 4;
+    if (i < waves.length) {
+      const w = waves[i];
+      fpF[offset + 0] = wrapTau(t * w.speed);       // t * speed
+      fpF[offset + 1] = 2 * Math.PI / w.perX;       // kx
+      fpF[offset + 2] = 2 * Math.PI / w.perY;       // ky
+      fpF[offset + 3] = w.amp;                      // amplitude
+      totalAmp += w.amp;
+    } else {
+      fpF[offset + 0] = 0;
+      fpF[offset + 1] = 0;
+      fpF[offset + 2] = 0;
+      fpF[offset + 3] = 0;
+    }
+  }
+
+  fpF[20] = 1;                   // 相位图增益
+  fpF[21] = waves.length;       // wave_count
+  fpF[22] = totalAmp;           // 总振幅（干涉场归一化用）
+  fpF[24] = eps;                // gain ε
+  fpF[25] = flip;               // 0=偶相位匹配 1=奇相位匹配（覆盖互补相邻对）
+  fpF[26] = keyMode;            // 0=颜色明度 1=颜色色相
+  fpF[27] = axis;               // 0=X 1=Y（由帧号决定）
+  fpF[28] = 0;
+  fpF[29] = 0;
+  fpF[30] = 0;
+  fpF[31] = 0;
   device.queue.writeBuffer(fpBuf, 0, FP);
 }
 
@@ -617,15 +813,15 @@ function frame() {
   if (advance) tAcc += STEP_DT * (+ui.spd.value);   // 每步固定时间增量，与帧率无关
 
   const eps  = +ui.eps.value;
-  const perX = +ui.px.value, perY = +ui.py.value;
   const rounds  = +ui.rnd.value;
   const keyMode = +ui.kmode.value;
+  const waves = getWaves();
 
   // 4 态循环：轴(X/Y) × 匹配相位(偶/奇)，覆盖全部相邻对
   const axis = swpStep & 1;             // 0=X 1=Y
   const flip = (swpStep >> 1) & 1;      // 0=偶相位 1=奇相位
-  writeField(tAcc, perX, perY, eps, axis, keyMode, flip);
-  writeRP(tAcc, perX, perY, axis);
+  writeField(tAcc, waves, eps, axis, keyMode, flip);
+  writeRP(tAcc, waves, axis);
 
   const enc = device.createCommandEncoder();
 
