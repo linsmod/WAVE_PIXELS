@@ -193,8 +193,33 @@ const rnd01 = (i, salt) => hash32((Math.imul(i, 2654435761) ^ salt) | 0) / 42949
 const TAU = 6.283185307179586;
 const wrapTau = (t) => t - Math.floor(t / TAU) * TAU;
 
+// ===== 图片来源 =====
+// 默认随机色；用户选图后按「填满裁剪」（cover）采样到 W×H：
+//   scale = max(W/iw, H/ih) → 超出部分被裁掉，不足则放大到铺满。
+let srcImage = null;     // ImageBitmap / HTMLImageElement
+let srcCanvas = null, srcCtx = null;
+
+function sampleImage(w, h) {
+  if (!srcCanvas) {
+    srcCanvas = document.createElement('canvas');
+    srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  if (srcCanvas.width !== w || srcCanvas.height !== h) {
+    srcCanvas.width = w; srcCanvas.height = h;   // 改尺寸会重置上下文状态
+  }
+  const iw = srcImage.naturalWidth || srcImage.width;
+  const ih = srcImage.naturalHeight || srcImage.height;
+  const s = Math.max(w / iw, h / ih);
+  const dw = iw * s, dh = ih * s;
+  srcCtx.imageSmoothingEnabled = s < 1;   // 放大用最近邻，像素图不糊
+  srcCtx.fillStyle = '#fff';              // 透明区域合成到白底
+  srcCtx.fillRect(0, 0, w, h);
+  srcCtx.drawImage(srcImage, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  return srcCtx.getImageData(0, 0, w, h).data;
+}
+
 // ===== Cell buffer =====
-// color : vec4(R,G,B,A)  —— 交换标的物，初始为随机颜色
+// color : vec4(R,G,B,A)  —— 交换标的物，初始为随机色或用户图片
 // 排序键 key 不再单独存储：它由 color 导出（明度 / 色相），
 // 相位则属于位置本身（field_phase(p)），像素不再携带相位。
 // 改变分辨率 → buffer 大小变化 → 必须重建 buffer 与引用它的 bind group。
@@ -212,13 +237,20 @@ function initCells() {
   const ab = new ArrayBuffer(W * H * CELL_WORDS * 4);
   const u = new Uint32Array(ab);
   const f = new Float32Array(ab);
+  const px = srcImage ? sampleImage(W, H) : null;
   for (let i = 0; i < W * H; i++) {
     const o = i * CELL_WORDS;
     u[o+0] = 0;                                 // swapped（本轮是否交换，调试视图用）
     // color @ word4..7（vec4，需 16 字节对齐 → word4）
-    f[o+4] = rnd01(i, 1);                       // R
-    f[o+5] = rnd01(i, 2);                       // G
-    f[o+6] = rnd01(i, 3);                       // B
+    if (px) {
+      f[o+4] = px[i*4+0] / 255;                 // R
+      f[o+5] = px[i*4+1] / 255;                 // G
+      f[o+6] = px[i*4+2] / 255;                 // B
+    } else {
+      f[o+4] = rnd01(i, 1);                     // R
+      f[o+5] = rnd01(i, 2);                     // G
+      f[o+6] = rnd01(i, 3);                     // B
+    }
     f[o+7] = 1.0;                               // A
   }
   device.queue.writeBuffer(cellBuf, 0, ab);
@@ -653,6 +685,18 @@ window.__dbg = {
   get H() { return H; },
   CELL_WORDS,
   frameNo: () => frameNo,
+  // 把 cell buffer 回读到 CPU：Float32Array，每格 8 个 word（color 在 word4..7）
+  readCells: async () => {
+    const size = W * H * CELL_WORDS * 4;
+    const rb = device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cellBuf, 0, rb, 0, size);
+    device.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap(); rb.destroy();
+    return out;
+  },
   field: () => {
     const p = swpPattern();
     const st = p.length ? p[swpIdx % p.length] : 0;
@@ -673,6 +717,8 @@ const ui = {
   waveCount: document.getElementById('waveCount'),
   gw:   document.getElementById('gw'),
   gh:   document.getElementById('gh'),
+  imgFile:  document.getElementById('imgFile'),
+  imgRandom: document.getElementById('imgRandom'),
   pause: document.getElementById('pause'),
   step:  document.getElementById('step'),
   reset: document.getElementById('reset'),
@@ -715,6 +761,42 @@ ui.gw.oninput = () => {
 ui.gh.oninput = () => {
   document.getElementById('ghV').textContent = ui.gh.value;
   applyGrid(+ui.gw.value, +ui.gh.value);
+};
+
+// ===== 选择图片作为初始颜色 =====
+// 选图后立刻按当前 W×H 重新采样；之后改分辨率会再次按新尺寸「填满裁剪」。
+async function loadImageFile(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file); } catch { /* 退回 <img> */ }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    return img;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+ui.imgFile.onchange = async () => {
+  const file = ui.imgFile.files && ui.imgFile.files[0];
+  if (!file) return;
+  try {
+    srcImage = await loadImageFile(file);
+    document.getElementById('imgV').textContent = file.name;
+    initCells();                       // 用新图片重新填充颜色
+    tAcc = 0; frameNo = 0; swpIdx = 0;  // 从头开始演化
+  } catch (ex) {
+    err('图片读取失败: ' + ex.message);
+  }
+};
+
+ui.imgRandom.onclick = () => {
+  srcImage = null;
+  ui.imgFile.value = '';
+  document.getElementById('imgV').textContent = '随机色';
+  initCells();
+  tAcc = 0; frameNo = 0; swpIdx = 0;
 };
 
 // 波控制面板动态更新
