@@ -14,10 +14,17 @@
   #hud.min{min-width:0;padding:5px 8px;border-radius:6px}
   #hud h1{font-size:12px;margin:0 0 8px;color:#8cf;font-weight:600;cursor:pointer;
     user-select:none;white-space:nowrap}
-  #hud.min label,#hud.min .row,#hud.min #fps{display:none}
+  #hud.min label,#hud.min .row,#hud.min #fps,#hud.min .wave-control{display:none}
   #hud.min h1{margin:0}
   #hud label{display:flex;align-items:center;justify-content:space-between;gap:8px}
   #hud input[type=range]{width:110px}
+  #hud label span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:112px}
+  #hud input[type=file]{width:100%;font-size:10px;color:#8cf;background:#1a2440;
+    border:1px solid #345;border-radius:4px;padding:3px;margin-top:2px}
+  #hud input[type=file]::file-selector-button{background:#253060;color:#8cf;
+    border:1px solid #345;border-radius:3px;font-family:inherit;font-size:10px;
+    padding:1px 6px;cursor:pointer;margin-right:6px}
+  #hud input[type=file]::file-selector-button:hover{background:#2f3d78}
   #hud select{background:#1a2440;color:#8cf;border:1px solid #345;border-radius:4px;
     font-family:inherit;font-size:11px;padding:2px 4px}
   #hud button{background:#1a2440;color:#8cf;border:1px solid #345;border-radius:4px;
@@ -31,6 +38,7 @@
   #fps{color:#6f6;font-size:11px;margin-top:6px}
   .wave-control{margin-top:8px;padding:6px;background:rgba(20,25,45,.6);border-radius:4px;border:1px solid #223}
   .wave-control label{margin-bottom:2px}
+  .wave-control .hint{font-size:10px;color:#6b7ba8;line-height:1.4;margin-top:3px}
   /* 四视图：紧凑 2×2。方格边长由 JS 按可用空间算出（见 fitStage），
      轨道也用固定像素，避免 1fr 把两张图推到各自半区中心而"散开" */
   #stage{flex:1 1 auto;display:grid;min-width:0;min-height:0;
@@ -59,6 +67,17 @@
     <button id="preset3">45°干涉</button>
     <button id="preset4">三波</button>
     <button id="preset5">四波</button>
+  </div>
+  <div class="wave-control">
+    <label>Grid W <span id="gwV">128</span><input id="gw" type="range" min="32" max="256" step="16" value="128"></label>
+    <label>Grid H <span id="ghV">128</span><input id="gh" type="range" min="32" max="256" step="16" value="128"></label>
+    <div class="hint">波周期按 128 基准网格标定，换分辨率时条纹数不变</div>
+  </div>
+  <div class="wave-control">
+    <label>图片来源 <span id="imgV">随机色</span></label>
+    <input id="imgFile" type="file" accept="image/*">
+    <div class="row"><button id="imgRandom">恢复随机色</button></div>
+    <div class="hint">按「填满裁剪」处理：超出部分裁掉，不够则放大到铺满</div>
   </div>
   <div id="waveControls">
     <div class="wave-control" data-wave="0">
@@ -111,27 +130,48 @@ const req   = mkCanvas('creq');    // 请求图
 const pair  = mkCanvas('cpair');   // 配对成功图
 
 // ===== 尺寸 =====
-const W = 128, H = 128;
-const TOTAL = W * H;
+// W/H 可在运行时调整：换分辨率要重建 cell buffer 与 bind group
+const MIN_GRID = 32, MAX_GRID = 256;
+let W = 128, H = 128;
 const CELL_WORDS = 8;           // 8 * 4B = 32B / cell (swapped@0, color@16)
-const REZ = 512;
-for (const { cv } of [pix, phase, req, pair]) { cv.width = REZ; cv.height = REZ; }
+// 画布后备存储跟随显示尺寸（×DPR），保证 1:1 采样不缩放、不糊。
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+let RES_X = 0, RES_Y = 0;
+for (const { cv } of [pix, phase, req, pair]) { cv.width = 512; cv.height = 512; }
 
-// 紧凑 2×2：按舞台可用空间算出方格边长，轨道写死像素并整体居中。
+// 紧凑 2×2：按舞台可用空间算出每格的显示尺寸，轨道写死像素并整体居中。
 // （用 1fr 分列时，两列各宽 500+，正方形只有短边大小，图就被推成"四散"了。）
+// 画布保持网格宽高比（W/H 可调时不能拉伸变形），缩到可用框内。
 const stageEl = document.getElementById('stage');
 function fitStage() {
   const GAP_X = 8, GAP_Y = 6, CAP_H = 16;
   const availW = stageEl.clientWidth, availH = stageEl.clientHeight;
   if (availW <= 0 || availH <= 0) return;
-  const side = Math.max(64, Math.floor(Math.min(
-    (availW - GAP_X) / 2, (availH - GAP_Y) / 2 - CAP_H)));
+  const boxW = (availW - GAP_X) / 2;            // 一格的可用宽
+  const boxH = (availH - GAP_Y) / 2 - CAP_H;    // 一格的可用高（减去标题行）
+  if (boxW <= 0 || boxH <= 0) return;
+  const ar = W / H;
+  let cw = boxW, ch = cw / ar;
+  if (ch > boxH) { ch = boxH; cw = ch * ar; }
+  cw = Math.max(64, Math.floor(cw));
+  ch = Math.max(64, Math.floor(ch));
+
+  stageEl.style.gridTemplateColumns = `${cw}px ${cw}px`;
+  stageEl.style.gridTemplateRows = `${ch + CAP_H}px ${ch + CAP_H}px`;
   for (const { cv } of [pix, phase, req, pair]) {
-    cv.style.width = side + 'px';
-    cv.style.height = side + 'px';
+    cv.style.width = cw + 'px';
+    cv.style.height = ch + 'px';
   }
-  stageEl.style.gridTemplateColumns = `${side}px ${side}px`;
-  stageEl.style.gridTemplateRows = `${side + CAP_H}px ${side + CAP_H}px`;
+
+  // 后备存储 = 显示尺寸 × DPR（1:1 采样，不缩放不糊）
+  const rx = Math.max(64, Math.min(4096, Math.round(cw * DPR)));
+  const ry = Math.max(64, Math.min(4096, Math.round(ch * DPR)));
+  if (rx === RES_X && ry === RES_Y) return;
+  RES_X = rx; RES_Y = ry;
+  for (const { cv, cx } of [pix, phase, req, pair]) {
+    cv.width = rx; cv.height = ry;
+    cx.configure({ device, format, alphaMode: 'opaque' });   // 尺寸变了必须重新 configure
+  }
 }
 new ResizeObserver(fitStage).observe(stageEl);
 fitStage();
@@ -157,16 +197,22 @@ const wrapTau = (t) => t - Math.floor(t / TAU) * TAU;
 // color : vec4(R,G,B,A)  —— 交换标的物，初始为随机颜色
 // 排序键 key 不再单独存储：它由 color 导出（明度 / 色相），
 // 相位则属于位置本身（field_phase(p)），像素不再携带相位。
-const cellBuf = device.createBuffer({
-  size: TOTAL * CELL_WORDS * 4,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-});
+// 改变分辨率 → buffer 大小变化 → 必须重建 buffer 与引用它的 bind group。
+let cellBuf = null;
+
+function createCellBuffer() {
+  if (cellBuf) cellBuf.destroy();
+  cellBuf = device.createBuffer({
+    size: W * H * CELL_WORDS * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
+}
 
 function initCells() {
-  const ab = new ArrayBuffer(TOTAL * CELL_WORDS * 4);
+  const ab = new ArrayBuffer(W * H * CELL_WORDS * 4);
   const u = new Uint32Array(ab);
   const f = new Float32Array(ab);
-  for (let i = 0; i < TOTAL; i++) {
+  for (let i = 0; i < W * H; i++) {
     const o = i * CELL_WORDS;
     u[o+0] = 0;                                 // swapped（本轮是否交换，调试视图用）
     // color @ word4..7（vec4，需 16 字节对齐 → word4）
@@ -177,6 +223,7 @@ function initCells() {
   }
   device.queue.writeBuffer(cellBuf, 0, ab);
 }
+createCellBuffer();
 initCells();
 
 // ===== Field uniform =====
@@ -192,9 +239,14 @@ const rpBuf = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | G
 const RP = new ArrayBuffer(128);
 const rpU = new Uint32Array(RP);
 const rpF = new Float32Array(RP);
+// 波周期以「参考网格 WAVE_REF」标定：perX/perY 的值不随当前分辨率变化，
+// 换分辨率时条纹条数保持不变（画面结构不变，只是采样更细）。
+const WAVE_REF = 128;
+const kOf = (per, n) => 2 * Math.PI / (per * n / WAVE_REF);
 function writeRP(t, waves, axis, keyMode = 0) {
   rpU[0] = W; rpU[1] = H; rpU[2] = 0; rpU[3] = 0;
-  rpF[4] = REZ; rpF[5] = REZ; rpF[6] = REZ / W; rpF[7] = axis;   // screen.w 传当前轴给渲染侧
+  // screen: (RES_X, RES_Y, cellSizeX, cellSizeY) —— 渲染侧按比例把片元映射回格子
+  rpF[4] = RES_X; rpF[5] = RES_Y; rpF[6] = RES_X / W; rpF[7] = RES_Y / H;
 
   let totalAmp = 0;
   // 写入 4 个波分量
@@ -203,8 +255,8 @@ function writeRP(t, waves, axis, keyMode = 0) {
     if (i < waves.length) {
       const w = waves[i];
       rpF[offset + 0] = wrapTau(t * w.speed);       // t * speed
-      rpF[offset + 1] = 2 * Math.PI / w.perX;       // kx
-      rpF[offset + 2] = 2 * Math.PI / w.perY;       // ky
+      rpF[offset + 1] = kOf(w.perX, W);             // kx
+      rpF[offset + 2] = kOf(w.perY, H);             // ky
       rpF[offset + 3] = w.amp;                      // amplitude
       totalAmp += w.amp;
     } else {
@@ -400,12 +452,12 @@ struct Cell {
 
 struct RP {
   dims:   vec4<u32>,       // W, H, _, _
-  screen: vec4<f32>,      // REZ, REZ, cellSize, _
+  screen: vec4<f32>,      // RES_X, RES_Y, cellSizeX, cellSizeY
   wave0:  vec4<f32>,      // 波0: t, kx, ky, amplitude
   wave1:  vec4<f32>,      // 波1: t, kx, ky, amplitude
   wave2:  vec4<f32>,      // 波2: t, kx, ky, amplitude
   wave3:  vec4<f32>,      // 波3: t, kx, ky, amplitude
-  phase:  vec4<f32>,      // (相位图增益), wave_count, _, _
+  phase:  vec4<f32>,      // (相位图增益), wave_count, totalAmp, _
   misc:   vec4<f32>,      // _, key_mode(0=明度,1=色相,2=灰度), _, _
 };
 
@@ -422,11 +474,11 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
   return vec4<f32>(p[vi], 0.0, 1.0);
 }
 
+// 后备存储尺寸不一定整除网格 → 用比例映射而不是除以 cellSize，避免误差累积
 fn cell_at(fc: vec4<f32>) -> vec4<u32> {
   let dims = rp.dims.xy;
-  let cs   = rp.screen.z;
-  let gx = min(u32(fc.x / cs), dims.x - 1u);
-  let gy = min(u32(fc.y / cs), dims.y - 1u);
+  let gx = min(u32(fc.x * f32(dims.x) / rp.screen.x), dims.x - 1u);
+  let gy = min(u32(fc.y * f32(dims.y) / rp.screen.y), dims.y - 1u);
   return vec4<u32>(gx, gy, gx + gy * dims.x, 0u);
 }
 
@@ -575,22 +627,31 @@ const pipeGray = mkRenderPipe('fs_gray');   // 灰值图（排序键灰阶）
 const pipeErr = await device.popErrorScope();
 if (pipeErr) err('管线创建失败: ' + pipeErr.message);
 
-const compBG = device.createBindGroup({
-  layout: compBGL,
-  entries: [
-    { binding: 0, resource: { buffer: cellBuf } },
-    { binding: 1, resource: { buffer: fpBuf } },
-  ],
-});
-const rendBG = device.createBindGroup({
-  layout: rendBGL,
-  entries: [
-    { binding: 0, resource: { buffer: cellBuf } },
-    { binding: 1, resource: { buffer: rpBuf } },
-  ],
-});
+// bind group 持有 cellBuf 引用 → 换分辨率重建 buffer 后必须重建 bind group
+let compBG = null, rendBG = null;
+function rebuildBindGroups() {
+  compBG = device.createBindGroup({
+    layout: compBGL,
+    entries: [
+      { binding: 0, resource: { buffer: cellBuf } },
+      { binding: 1, resource: { buffer: fpBuf } },
+    ],
+  });
+  rendBG = device.createBindGroup({
+    layout: rendBGL,
+    entries: [
+      { binding: 0, resource: { buffer: cellBuf } },
+      { binding: 1, resource: { buffer: rpBuf } },
+    ],
+  });
+}
+rebuildBindGroups();
 window.__dbg = {
-  device, cellBuf, W, H, CELL_WORDS,
+  device,
+  get cellBuf() { return cellBuf; },
+  get W() { return W; },
+  get H() { return H; },
+  CELL_WORDS,
   frameNo: () => frameNo,
   field: () => {
     const p = swpPattern();
@@ -610,6 +671,8 @@ const ui = {
   swapY: document.getElementById('swapY'),
   sps:   document.getElementById('sps'),
   waveCount: document.getElementById('waveCount'),
+  gw:   document.getElementById('gw'),
+  gh:   document.getElementById('gh'),
   pause: document.getElementById('pause'),
   step:  document.getElementById('step'),
   reset: document.getElementById('reset'),
@@ -625,6 +688,33 @@ ui.waveCount.oninput = () => {
   const count = +ui.waveCount.value;
   document.getElementById('waveCountV').textContent = count;
   updateWaveControls(count);
+};
+
+// ===== 网格分辨率切换 =====
+// 改变 W/H 会影响三处：cell buffer 大小、canvas 显示尺寸、cell 在屏幕上的取样。
+// buffer 与 bind group 必须一起重建，否则会拿到旧 buffer 的引用。
+function applyGrid(nw, nh) {
+  nw = Math.max(MIN_GRID, Math.min(MAX_GRID, Math.round(nw)));
+  nh = Math.max(MIN_GRID, Math.min(MAX_GRID, Math.round(nh)));
+  if (nw === W && nh === H) return;
+  W = nw; H = nh;
+
+  createCellBuffer();     // 新尺寸 → 新 buffer
+  initCells();            // 重新随机初始颜色
+  rebuildBindGroups();    // bind group 持有旧 buffer 引用，必须重建
+  fitStage();             // 重排 + 重建 canvas 后备存储（内部会按需重新 configure）
+
+  swpIdx = 0;             // 交换态序列重置
+  frameNo = 0;
+}
+
+ui.gw.oninput = () => {
+  document.getElementById('gwV').textContent = ui.gw.value;
+  applyGrid(+ui.gw.value, +ui.gh.value);
+};
+ui.gh.oninput = () => {
+  document.getElementById('ghV').textContent = ui.gh.value;
+  applyGrid(+ui.gw.value, +ui.gh.value);
 };
 
 // 波控制面板动态更新
@@ -755,8 +845,8 @@ function writeField(t, waves, eps, axis, keyMode, flip) {
     if (i < waves.length) {
       const w = waves[i];
       fpF[offset + 0] = wrapTau(t * w.speed);       // t * speed
-      fpF[offset + 1] = 2 * Math.PI / w.perX;       // kx
-      fpF[offset + 2] = 2 * Math.PI / w.perY;       // ky
+      fpF[offset + 1] = kOf(w.perX, W);             // kx
+      fpF[offset + 2] = kOf(w.perY, H);             // ky
       fpF[offset + 3] = w.amp;                      // amplitude
       totalAmp += w.amp;
     } else {
